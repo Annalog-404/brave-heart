@@ -1,0 +1,15 @@
+# Personal backups exported from the app. These hold your journal: never commit them.
+bh-*.json
+brave-heart-backup-*.json
+
+# macOS
+.DS_Store
+
+# Hosting tools
+.netlify/
+.vercel/
+
+# Editors
+.vscode/
+.idea/
+*.swp
