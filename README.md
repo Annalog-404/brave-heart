@@ -7,12 +7,12 @@ Plain HTML, CSS and JavaScript. No build step, no dependencies, no server.
 ## What's inside
 
 - **Setup**: on first open you write your mantra, and the app suggests your values from its words. You can leave any out or add your own.
-- **Home**: your mantra, today's habits, goal progress and next event
+- **Home**: your mantra, today's goal check-offs, goal progress and next event
 - **Values**: each value with a daily practice, Swap, weekly count and your latest moment. Recommit monthly.
 - **Log a moment**: what happened, who was there, how it felt before and after, what you learned
-- **Journal**: morning (mood, 3 gratitudes, what would make today brave, today I am, one photo, a year ago today) and evening (3 good things, values lived, let go, mood)
-- **Goals**: progress with + and −, why it matters, next step, and a 7-day habit tracker
-- **Events**: considering, registered or attended, with a brave step. Reflection fields appear once an event is marked attended.
+- **Journal**: morning (mood, 3 gratitudes, free writing, one photo, a year ago today) and evening (3 good things, values lived, let go, mood)
+- **Goals**: daily goals (e.g. workout 20 days a month), weekly goals (e.g. call family 4 weeks a month) and amount goals (e.g. read 12 books). Each month shows done vs target, where you'd expect to be by today, and an overview. Daily and weekly goals are ticked off on Home and the Goals screen; amount goals keep a dated progress log.
+- **Events**: one day or several, considering, registered or attended. Reflection fields appear once an event is marked attended.
 - **Settings**: mantra and values, PIN lock, backup export and import, erase
 
 ## Files

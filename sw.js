@@ -1,5 +1,5 @@
 // Bump this whenever any file changes, so phones download the new version as one set.
-const CACHE = 'brave-heart-v5';
+const CACHE = 'brave-heart-v15';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png', './apple-touch-icon.png', './fonts/inter-latin.woff2'];
 
 self.addEventListener('install', (e) => {

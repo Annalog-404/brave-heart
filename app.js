@@ -28,7 +28,6 @@ const longDate = (k) => fmt(k, { weekday: 'long', day: 'numeric', month: 'long' 
 const shortDate = (k) => fmt(k, { day: 'numeric', month: 'short' });
 const monthShort = (k) => fmt(k, { month: 'short' });
 const weekdayShort = (k) => fmt(k, { weekday: 'short' });
-const dayLetter = (k) => fmt(k, { weekday: 'narrow' });
 const dayNumber = (k) => String(parseKey(k).getDate());
 const fmtNum = (n) => String(Math.round(Number(n) * 100) / 100);
 const time12 = (t) => {
@@ -172,7 +171,7 @@ function normalize(raw) {
     const m = obj(j.morning);
     const e = obj(j.evening);
     return {
-      morning: { mood: oneOf(m.mood, MOODS, ''), grateful: lines(m.grateful), brave: str(m.brave), iam: str(m.iam) },
+      morning: { mood: oneOf(m.mood, MOODS, ''), grateful: lines(m.grateful), brave: str(m.brave), iam: str(m.iam), free: str(m.free, 20000) },
       evening: { good: lines(e.good), values: arr(e.values).filter(isId), letgo: str(e.letgo), mood: oneOf(e.mood, MOODS, '') },
     };
   });
@@ -191,6 +190,15 @@ function normalize(raw) {
       unit: str(g.unit, 40),
       next: str(g.next, 500),
       habit: habitName ? { name: habitName, perWeek: Math.min(7, Math.max(1, Math.round(num(h.perWeek, 3)))) } : null,
+      kind: oneOf(g.kind, ['daily', 'weekly', 'total'], 'total'),
+      perMonth: Math.min(g.kind === 'weekly' ? 5 : 31, Math.max(1, Math.round(num(g.perMonth, g.kind === 'weekly' ? 4 : 20)))),
+      done: mapOf(g.done, (k) => isDay(k) || /^\d{4}-\d{2}-W[1-5]$/.test(k), isTrue),
+      log: arr(g.log).filter((x) => x && isDay(x.date) && Number.isFinite(x.delta) && x.delta !== 0).slice(-2000).map((x) => ({
+        date: x.date,
+        delta: Math.round(x.delta * 100) / 100,
+        note: str(x.note, 300),
+        at: str(x.at, 40),
+      })),
     };
   }));
   s.habitLog = mapOf(raw.habitLog, isId, (m) => mapOf(m, isDay, isTrue));
@@ -200,6 +208,7 @@ function normalize(raw) {
     createdAt: str(e.createdAt, 40),
     title: str(e.title, 200).trim() || 'Untitled event',
     date: isDay(e.date) ? e.date : dkey(),
+    endDate: isDay(e.endDate) && isDay(e.date) && e.endDate > e.date ? e.endDate : '',
     time: isTime(e.time) ? e.time : '',
     place: str(e.place, 300),
     cost: str(e.cost, 100),
@@ -368,36 +377,38 @@ function practiceFor(v, k) {
   return list[(day + swaps) % list.length];
 }
 const practiceDone = (vid, k) => !!(state.practiceDone[k] || {})[vid];
-const habitDone = (gid, k) => !!(state.habitLog[gid] || {})[k];
 const goalPercent = (g) => (g.target > 0 ? Math.max(0, Math.min(100, Math.round((g.current / g.target) * 100))) : 0);
 const goalAmount = (g) => `${fmtNum(g.current)} of ${fmtNum(g.target)}${g.unit ? ' ' + esc(g.unit) : ''}`;
 
 function sortMoments() {
   state.moments.sort((a, b) => (b.date + b.createdAt).localeCompare(a.date + a.createdAt));
 }
+// A multi-day event stays upcoming until its last day is over.
+const lastDay = (e) => e.endDate || e.date;
+const dayIndex = (k) => { const [y, m, d] = k.split('-').map(Number); return Date.UTC(y, m - 1, d) / 86400000; };
 function upcomingEvents() {
   const t = dkey();
   return state.events
-    .filter((e) => e.date >= t && e.status !== 'attended')
+    .filter((e) => lastDay(e) >= t && e.status !== 'attended')
     .sort((a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || '')));
 }
 function pastEvents() {
   const t = dkey();
   return state.events
-    .filter((e) => e.date < t || e.status === 'attended')
+    .filter((e) => lastDay(e) < t || e.status === 'attended')
     .sort((a, b) => b.date.localeCompare(a.date));
 }
 
 function jEntry(d) {
   if (!state.journal[d]) {
     state.journal[d] = {
-      morning: { mood: '', grateful: ['', '', ''], brave: '', iam: '' },
+      morning: { mood: '', grateful: ['', '', ''], free: '' },
       evening: { good: ['', '', ''], values: [], letgo: '', mood: '' },
     };
   }
   return state.journal[d];
 }
-const J_FIELDS = { morning: ['mood', 'grateful', 'brave', 'iam'], evening: ['good', 'values', 'letgo', 'mood'] };
+const J_FIELDS = { morning: ['mood', 'grateful', 'free'], evening: ['good', 'values', 'letgo', 'mood'] };
 function setJ(d, part, path, val) {
   const [k, i] = path.split('.');
   if (!isDay(d) || !J_FIELDS[part] || !J_FIELDS[part].includes(k)) return;
@@ -589,18 +600,25 @@ function viewHome() {
   const t = dkey();
   const h = new Date().getHours();
   const greet = h < 12 ? 'Good Morning' : h < 17 ? 'Good Afternoon' : 'Good Evening';
-  const habits = state.goals.filter((g) => g.habit && g.habit.name);
-  const done = habits.filter((g) => habitDone(g.id, t)).length;
   const next = upcomingEvents()[0];
 
-  const today = habits.length
-    ? habits.map((g) => habitRow(g, t)).join('')
-    : `<p class="empty">Habits you add to a goal show up here each day. <a class="link" href="#/goals/new">Add goal</a></p>`;
+  const m = monthOf(t);
+  const checks = state.goals.filter((g) => g.kind !== 'total').map((g) => {
+    const k = g.kind === 'daily' ? t : weekOf(t);
+    const on = !!g.done[k];
+    return `<button type="button" class="row" data-action="tick" data-id="${esc(g.id)}" data-k="${esc(k)}" aria-pressed="${on}">
+      <span class="check${on ? ' on' : ''}" aria-hidden="true">${CHECK}</span>
+      <span class="grow">${esc(g.name)}</span>
+      <span class="small muted">${g.kind === 'daily' ? 'Today' : 'This week'}</span>
+    </button>`;
+  }).join('');
 
   const goals = state.goals.length
-    ? state.goals.slice(0, 3).map((g) => {
-      const p = goalPercent(g);
-      return `<a class="goal-sum" href="#/goals"><div class="between"><span class="strong">${esc(g.name)}</span><span class="muted num nowrap">${goalAmount(g)}</span></div><div class="progress" role="progressbar" aria-label="${esc(g.name)}" aria-valuenow="${p}" aria-valuemin="0" aria-valuemax="100"><i style="width:${p}%"></i></div></a>`;
+    ? state.goals.slice(0, 4).map((g) => {
+      const s = g.kind === 'total' ? null : monthStats(g, m);
+      const p = s ? s.pct : goalPercent(g);
+      const amount = s ? `${s.done} of ${s.target} ${unitWord(g, s.target)}` : goalAmount(g);
+      return `<a class="goal-sum" href="#/goals/${esc(g.id)}"><div class="between"><span class="strong">${esc(g.name)}</span><span class="muted num nowrap">${amount}</span></div>${bar(g.name, p, s ? s.expPct : undefined)}</a>`;
     }).join('')
     : `<p class="empty">No goals yet. <a class="link" href="#/goals/new">Add goal</a></p>`;
 
@@ -618,10 +636,7 @@ function viewHome() {
       <p class="mantra">${esc(state.mantra)}</p>
       <a class="values-line" href="#/values">${state.values.map((v) => esc(v.name)).join(', ')}</a>
     </section>
-    <section class="section" aria-labelledby="h-today">
-      <div class="between"><h2 id="h-today" class="label">Today</h2>${habits.length ? `<span class="small muted num">${done} of ${habits.length}</span>` : ''}</div>
-      ${today}
-    </section>
+    ${checks ? `<section class="section" aria-labelledby="h-today"><h2 id="h-today" class="label">Today</h2>${checks}</section>` : ''}
     <section class="section" aria-labelledby="h-goals">
       <div class="between"><h2 id="h-goals" class="label">Goals</h2>${state.goals.length ? '<a class="link small" href="#/goals">View all</a>' : ''}</div>
       ${goals}
@@ -632,14 +647,6 @@ function viewHome() {
     </section>`;
 }
 
-function habitRow(g, k) {
-  const on = habitDone(g.id, k);
-  return `<button type="button" class="row" data-action="habit" data-id="${esc(g.id)}" data-d="${esc(k)}" aria-pressed="${on}">
-    <span class="check${on ? ' on' : ''}" aria-hidden="true">${CHECK}</span>
-    <span class="grow">${esc(g.habit.name)}</span>
-    <span class="small muted">${esc(valueName(g.valueId))}</span>
-  </button>`;
-}
 
 function viewValues() {
   const t = dkey();
@@ -752,6 +759,9 @@ function viewMoment(q) {
     </form>`;
 }
 
+// Entries from before free writing keep their old answers, shown as the start of the free writing.
+const freeText = (m) => (m.free !== undefined && m.free !== '' ? m.free : [m.brave, m.iam].filter(Boolean).join('\n\n'));
+
 function viewJournal(part, d) {
   const t = dkey();
   const j = state.journal[d] || {};
@@ -781,8 +791,7 @@ function viewJournal(part, d) {
     body = `
       <fieldset><legend class="label">How I feel</legend>${moodSeg(m.mood || '')}</fieldset>
       <section class="section"><h2 class="prompt">I'm grateful for</h2>${numbered('grateful', m.grateful, 'Grateful for', 'Something small counts too')}</section>
-      <section class="section"><h2 class="prompt">What would make today brave?</h2>${line('brave', m.brave || '', 'What would make today brave')}</section>
-      <section class="section"><h2 class="prompt">Today, I am</h2>${line('iam', m.iam || '', 'Today I am')}</section>
+      <section class="section"><h2 class="prompt">Free writing</h2><textarea class="line-input free" rows="6" ${bind('free')} aria-label="Free writing" placeholder="Whatever is on your mind.">${esc(freeText(m))}</textarea></section>
       <div class="photo-row">
         <div class="photo-slot" data-photo-slot="${d}">
           <label class="photo-add"><input class="sr" type="file" accept="image/*" data-photo="${d}">${icon('image')}<span>Add photo</span></label>
@@ -820,91 +829,303 @@ function viewJournal(part, d) {
     <p class="small muted">${saveFailed ? 'Not saved. Your phone’s storage may be full.' : 'Saved automatically. Stored only on this phone.'}</p>`;
 }
 
-function viewGoals() {
-  const t = dkey();
-  const days = [-6, -5, -4, -3, -2, -1, 0].map((n) => addDays(t, n));
-  const list = state.goals.map((g) => {
-    const p = goalPercent(g);
-    const vName = valueName(g.valueId);
-    const meta = vName || g.why ? `<p class="small muted meta">${vName ? `<span class="ink">${esc(vName)}</span>${g.why ? '. ' : ''}` : ''}${esc(g.why)}</p>` : '<div class="meta-gap"></div>';
-    const habit = g.habit && g.habit.name ? `
-      <div class="habit">
-        <div class="between small"><span class="muted">${esc(g.habit.name)}, ${times(g.habit.perWeek).toLowerCase()} a week</span><span class="muted num nowrap">${days.filter((k) => habitDone(g.id, k)).length} of ${g.habit.perWeek} in 7 days</span></div>
-        <div class="days">${days.map((k) => {
-          const on = habitDone(g.id, k);
-          return `<button type="button" class="day${on ? ' on' : ''}${k === t ? ' today' : ''}" data-action="habit" data-id="${esc(g.id)}" data-d="${k}" aria-pressed="${on}" aria-label="${esc(g.habit.name)}, ${esc(longDate(k))}"><span>${esc(dayLetter(k))}</span><span class="num">${dayNumber(k)}</span></button>`;
-        }).join('')}</div>
-      </div>` : '';
-    return `<article class="goal">
-      <div class="between"><h2>${esc(g.name)}</h2><span class="num pct">${p}%</span></div>
-      ${meta}
-      <div class="progress" role="progressbar" aria-label="${esc(g.name)}" aria-valuenow="${p}" aria-valuemin="0" aria-valuemax="100"><i style="width:${p}%"></i></div>
-      <div class="goal-step">
-        <div class="grow">
-          <p class="small muted num">${goalAmount(g)}</p>
-          ${g.next ? `<p class="body next"><span class="strong">Next:</span> ${esc(g.next)}</p>` : ''}
-        </div>
-        <div class="stepper">
-          <button type="button" data-action="goalStep" data-id="${esc(g.id)}" data-delta="-1" aria-label="Decrease progress on ${esc(g.name)}">−</button>
-          <span class="num stepper-value">${fmtNum(g.current)}</span>
-          <button type="button" data-action="goalStep" data-id="${esc(g.id)}" data-delta="1" aria-label="Increase progress on ${esc(g.name)}">+</button>
-        </div>
+const logFields = `<div class="log-form">
+        <label class="field"><span class="small muted">Amount</span><input type="number" name="amount" value="1" step="any" inputmode="decimal" required></label>
+        <label class="field"><span class="small muted">Note (optional)</span><input type="text" name="note" maxlength="300" placeholder="How did it go?"></label>
       </div>
-      ${habit}
-      <a class="link small" href="#/goals/${esc(g.id)}">Edit goal</a>
-    </article>`;
-  }).join('');
+      <span class="hint">Use a minus number to correct a mistake.</span>`;
+// The Log button opens this form under the goal, so a note can go with every bit of progress.
+const inlineLog = (g) => `<form class="stack-s log-inline" data-form="logProgress" data-id="${esc(g.id)}" hidden>
+      ${logFields}
+      <div class="actions"><button type="button" class="btn btn-quiet" data-action="closeLog">Cancel</button><button class="btn btn-primary" type="submit">Save</button></div>
+    </form>`;
+const signed = (n, unit) => `${n > 0 ? '+' : '−'}${fmtNum(Math.abs(n))}${unit ? ' ' + esc(unit) : ''}`;
 
+// Writing progress down, with when and how it went, is one of the strongest helpers for reaching a goal.
+function logProgress(g, delta, note = '') {
+  const before = Number(g.current);
+  g.current = Math.max(0, Math.round((before + delta) * 100) / 100);
+  const change = Math.round((g.current - before) * 100) / 100;
+  if (!change) return;
+  const t = dkey();
+  const last = g.log[g.log.length - 1];
+  // Quick taps on the same day without a note add up into one entry.
+  if (!note && last && last.date === t && !last.note) {
+    last.delta = Math.round((last.delta + change) * 100) / 100;
+    last.at = new Date().toISOString();
+    if (!last.delta) g.log.pop();
+  } else {
+    g.log.push({ date: t, delta: change, note, at: new Date().toISOString() });
+  }
+}
+
+/* ---------- Monthly goals ---------- */
+
+const monthOf = (k) => k.slice(0, 7);
+const isMonth = (m) => typeof m === 'string' && /^\d{4}-\d{2}$/.test(m) && isDay(`${m}-01`);
+const daysIn = (m) => { const [y, mo] = m.split('-').map(Number); return new Date(y, mo, 0).getDate(); };
+const weeksIn = (m) => Math.ceil(daysIn(m) / 7);
+// Weeks follow the month, like a planner: W1 is the 1st to the 7th, W5 is the 29th onward.
+const weekOf = (k) => `${monthOf(k)}-W${Math.ceil(Number(k.slice(8)) / 7)}`;
+const monthName = (m) => fmt(`${m}-01`, { month: 'long', year: 'numeric' });
+const shiftMonth = (m, n) => { const [y, mo] = m.split('-').map(Number); const d = new Date(y, mo - 1 + n, 1); return dkey(d).slice(0, 7); };
+const unitWord = (g, n) => (g.kind === 'daily' ? (n === 1 ? 'day' : 'days') : n === 1 ? 'week' : 'weeks');
+
+// Done, target and where you'd expect to be by today, for one month.
+function monthStats(g, m) {
+  const t = dkey();
+  const span = g.kind === 'daily' ? daysIn(m) : weeksIn(m);
+  const target = Math.min(g.perMonth, span);
+  const done = Object.keys(g.done).filter((k) => k.startsWith(`${m}-`)).length;
+  const today = g.kind === 'daily' ? Number(t.slice(8)) : Math.ceil(Number(t.slice(8)) / 7);
+  const elapsed = m < monthOf(t) ? span : m > monthOf(t) ? 0 : today;
+  const expected = Math.round((target * elapsed) / span);
+  return { done, target, expected, pct: Math.min(100, Math.round((done / target) * 100)), expPct: Math.min(100, Math.round((expected / target) * 100)) };
+}
+function paceText(s, g, m) {
+  if (s.done >= s.target) return 'Target reached';
+  if (m < monthOf(dkey())) return `${s.target - s.done} short`;
+  if (s.done >= s.expected) return `On pace. Expected ${s.expected} by today`;
+  return `${s.expected - s.done} behind. Expected ${s.expected} by today`;
+}
+const bar = (label, pct, expPct) => `<div class="progress" role="progressbar" aria-label="${esc(label)}" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pct}%"></i>${expPct === undefined ? '' : `<b style="left:${expPct}%" title="Expected by today"></b>`}</div>`;
+
+const tickButton = (g, k, label, aria, extra = '') => {
+  const on = !!g.done[k];
+  return `<button type="button" class="day${on ? ' on' : ''}${extra}" data-action="tick" data-id="${esc(g.id)}" data-k="${esc(k)}" aria-pressed="${on}" aria-label="${esc(g.name)}, ${esc(aria)}">${label}</button>`;
+};
+// Last 7 days for a daily goal, or the month's weeks for a weekly goal.
+function tickStrip(g, m) {
+  const t = dkey();
+  if (g.kind === 'daily') {
+    if (m !== monthOf(t)) return '';
+    const days = [-6, -5, -4, -3, -2, -1, 0].map((n) => addDays(t, n));
+    return `<div class="days">${days.map((k) => tickButton(g, k, `<span>${esc(fmt(k, { weekday: 'narrow' }))}</span><span class="num">${dayNumber(k)}</span>`, longDate(k), k === t ? ' today' : '')).join('')}</div>`;
+  }
+  const n = weeksIn(m);
+  const current = monthOf(t) === m ? weekOf(t) : '';
+  return `<div class="days weeks">${Array.from({ length: n }, (_, i) => {
+    const k = `${m}-W${i + 1}`;
+    const future = m > monthOf(t) || (current && k > current);
+    return future
+      ? `<span class="day off" aria-hidden="true">W${i + 1}</span>`
+      : tickButton(g, k, `W${i + 1}`, `week ${i + 1} of ${monthName(m)}`, k === current ? ' today' : '');
+  }).join('')}</div>`;
+}
+
+// "today", "yesterday", "on Monday", "on 3 Nov"
+const whenText = (k) => { const r = relDay(k); return r === 'Today' || r === 'Yesterday' ? r.toLowerCase() : `on ${r}`; };
+// Every goal ends with the same actions, so Edit is always in the same place.
+const goalActions = (g, view, extra = '') => `<div class="goal-actions">
+    <a class="link small" href="#/goals/${esc(g.id)}">${view}</a>
+    <a class="link small" href="#/goals/${esc(g.id)}/edit">Edit</a>
+    <span class="grow"></span>
+    ${extra}
+  </div>`;
+
+function goalRow(g, m) {
+  if (g.kind === 'total') {
+    const p = goalPercent(g);
+    const last = g.log.length ? g.log[g.log.length - 1] : null;
+    return `<article class="goal">
+      <a class="goal-head" href="#/goals/${esc(g.id)}"><div class="between"><h2>${esc(g.name)}</h2><span class="num pct">${p}%</span></div></a>
+      ${bar(g.name, p)}
+      <p class="small muted pace num">${goalAmount(g)}${last ? `. Last logged ${esc(whenText(last.date))}` : ''}</p>
+      ${goalActions(g, 'History', `<button type="button" class="btn btn-outline add-one" data-action="openLog" aria-label="Log progress on ${esc(g.name)}">Log</button>`)}
+      ${inlineLog(g)}
+    </article>`;
+  }
+  const s = monthStats(g, m);
+  return `<article class="goal">
+    <a class="goal-head" href="#/goals/${esc(g.id)}"><div class="between"><h2>${esc(g.name)}</h2><span class="num pct">${s.done} of ${s.target} ${unitWord(g, s.target)}</span></div></a>
+    ${bar(g.name, s.pct, s.expPct)}
+    <p class="small muted pace">${esc(paceText(s, g, m))}</p>
+    ${tickStrip(g, m)}
+    ${goalActions(g, g.kind === 'daily' ? 'Calendar' : 'History')}
+  </article>`;
+}
+
+// Combined done and expected for a group of goals, like the summary at the top of a goals sheet.
+function overview(goals, m) {
+  const all = goals.map((g) => monthStats(g, m));
+  const target = all.reduce((a, s) => a + s.target, 0);
+  if (!target) return null;
+  const done = all.reduce((a, s) => a + Math.min(s.done, s.target), 0);
+  const expected = all.reduce((a, s) => a + s.expected, 0);
+  return { pct: Math.round((done / target) * 100), expPct: Math.round((expected / target) * 100) };
+}
+
+function viewGoals(qm) {
+  const t = dkey();
+  const m = isMonth(qm) ? qm : monthOf(t);
+  const daily = state.goals.filter((g) => g.kind === 'daily');
+  const weekly = state.goals.filter((g) => g.kind === 'weekly');
+  const totals = state.goals.filter((g) => g.kind === 'total');
+  const stat = (label, o) => (o ? `<div class="stat">
+      <p class="stat-num num">${o.pct}%</p>
+      <p class="small strong">${label}</p>
+      ${bar(label, o.pct, o.expPct)}
+      <p class="small muted">${m < monthOf(t) ? 'Month total' : `${o.pct >= o.expPct ? 'On pace' : 'Behind'}, ${o.expPct}% expected by today`}</p>
+    </div>` : '');
+  const od = overview(daily, m);
+  const ow = overview(weekly, m);
+  const oa = totals.length ? { pct: Math.round(totals.reduce((a, g) => a + goalPercent(g), 0) / totals.length) } : null;
+  const amountStat = oa ? `<div class="stat">
+      <p class="stat-num num">${oa.pct}%</p>
+      <p class="small strong">Amount goals</p>
+      ${bar('Amount goals', oa.pct)}
+      <p class="small muted">Average of ${totals.length} goal${totals.length === 1 ? '' : 's'}, all time</p>
+    </div>` : '';
+  const group = (label, goals) => (goals.length ? `<section class="section"><h2 class="label">${label}</h2>${goals.map((g) => goalRow(g, m)).join('')}</section>` : '');
+  const nav = `<nav class="month-nav" aria-label="Month">
+      <a class="link" href="#/goals?m=${shiftMonth(m, -1)}" aria-label="Previous month">${icon('back', 18, 1.8)}</a>
+      <span class="strong">${esc(monthName(m))}</span>
+      ${m < monthOf(t) ? `<a class="link" href="#/goals?m=${shiftMonth(m, 1)}" aria-label="Next month">${icon('forward', 18, 1.8)}</a>` : '<span></span>'}
+    </nav>`;
+
+  if (!state.goals.length) {
+    return `
+      <header class="head">
+        <h1 class="title">Goals</h1>
+        <a class="btn btn-outline" href="#/goals/new">${icon('plus', 14, 2)}Add goal</a>
+      </header>
+      <p class="empty section">No goals yet. Add daily goals like a workout, weekly goals like calling family, or an amount like books to read.</p>`;
+  }
   return `
     <header class="head">
       <h1 class="title">Goals</h1>
       <a class="btn btn-outline" href="#/goals/new">${icon('plus', 14, 2)}Add goal</a>
     </header>
-    ${state.goals.length
-      ? `<div>${list}</div>`
-      : `<p class="empty section">No goals yet. Pick something you're working toward, why it matters, and one small habit that moves it forward.</p>`}`;
+    ${daily.length || weekly.length ? nav : ''}
+    <section class="section" aria-label="Overview">
+      <h2 class="label">Overview</h2>
+      <div class="stats">${stat('Daily goals', od)}${stat('Weekly goals', ow)}${amountStat}</div>
+      ${daily.length || weekly.length ? '' : '<p class="small muted pace">To tick off days or weeks and track a monthly target, open a goal, tap Edit, and set How often to Daily or Weekly.</p>'}
+    </section>
+    ${group('Daily goals', daily)}
+    ${group('Weekly goals', weekly)}
+    ${group('Amount goals', totals)}`;
 }
+
+function monthGrid(g, m) {
+  const t = dkey();
+  const first = parseKey(`${m}-01`);
+  const lead = (first.getDay() + 6) % 7;
+  const cells = Array.from({ length: lead }, () => '<span></span>');
+  for (let d = 1; d <= daysIn(m); d += 1) {
+    const k = `${m}-${pad(d)}`;
+    cells.push(k > t ? `<span class="day off num">${d}</span>` : tickButton(g, k, `<span class="num">${d}</span>`, longDate(k), k === t ? ' today' : ''));
+  }
+  const heads = ['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((x) => `<span class="small muted">${x}</span>`).join('');
+  return `<div class="cal-head">${heads}</div><div class="cal">${cells.join('')}</div>`;
+}
+
+function viewGoal(id, qm) {
+  const g = goalById(id);
+  if (!g) return viewNotFound('#/goals', 'Goals');
+  const head = `
+    ${backLink('#/goals', 'Goals')}
+    <header class="head">
+      <h1 class="title">${esc(g.name)}</h1>
+      <a class="link" href="#/goals/${esc(g.id)}/edit">Edit</a>
+    </header>`;
+
+  if (g.kind !== 'total') {
+    const t = dkey();
+    const m = isMonth(qm) && qm <= monthOf(t) ? qm : monthOf(t);
+    const s = monthStats(g, m);
+    const past = Array.from({ length: 6 }, (_, i) => shiftMonth(monthOf(t), -(i + 1)))
+      .map((pm) => [pm, monthStats(g, pm)])
+      .filter(([, ps]) => ps.done > 0);
+    return `${head}
+      <nav class="month-nav" aria-label="Month">
+        <a class="link" href="#/goals/${esc(g.id)}?m=${shiftMonth(m, -1)}" aria-label="Previous month">${icon('back', 18, 1.8)}</a>
+        <span class="strong">${esc(monthName(m))}</span>
+        ${m < monthOf(t) ? `<a class="link" href="#/goals/${esc(g.id)}?m=${shiftMonth(m, 1)}" aria-label="Next month">${icon('forward', 18, 1.8)}</a>` : '<span></span>'}
+      </nav>
+      <section class="section">
+        <div class="between"><p class="goal-amount num">${s.done} of ${s.target} ${unitWord(g, s.target)}</p><span class="num pct">${s.pct}%</span></div>
+        ${bar(g.name, s.pct, s.expPct)}
+        <p class="small muted pace">${esc(paceText(s, g, m))}</p>
+      </section>
+      <section class="section">
+        <h2 class="label">${g.kind === 'daily' ? 'Tap the days you did it' : 'Tap the weeks you did it'}</h2>
+        ${g.kind === 'daily' ? monthGrid(g, m) : tickStrip(g, m)}
+      </section>
+      ${past.length ? `<section class="section"><h2 class="label">Earlier months</h2>${past.map(([pm, ps]) => `<a class="log-row" href="#/goals/${esc(g.id)}?m=${pm}"><span class="small muted">${esc(fmt(`${pm}-01`, { month: 'short', year: 'numeric' }))}</span><span class="num">${ps.done} of ${ps.target} ${unitWord(g, ps.target)}, ${ps.pct}%</span></a>`).join('')}</section>` : ''}`;
+  }
+
+  const p = goalPercent(g);
+  const logged = g.log.reduce((sum, x) => sum + x.delta, 0);
+  const startedAt = Math.round((g.current - logged) * 100) / 100;
+  const history = [...g.log].reverse().map((x) => `<div class="log-row">
+      <span class="small muted">${esc(relDay(x.date))}</span>
+      <div><p class="strong num">${signed(x.delta, g.unit)}</p>${x.note ? `<p class="body">${esc(x.note)}</p>` : ''}</div>
+    </div>`).join('');
+  return `${head}
+    <section class="section">
+      <div class="between"><p class="goal-amount num">${goalAmount(g)}</p><span class="num pct">${p}%</span></div>
+      ${bar(g.name, p)}
+    </section>
+    <form class="stack-s section" data-form="logProgress" data-id="${esc(g.id)}">
+      <h2 class="label">Log progress</h2>
+      ${logFields}
+      <button class="btn btn-primary" type="submit">Log progress</button>
+    </form>
+    <section class="section" aria-labelledby="h-history">
+      <h2 id="h-history" class="label">History</h2>
+      ${history || '<p class="empty">Nothing logged yet. Use the form above, or Log on the Goals screen.</p>'}
+      ${startedAt > 0 ? `<p class="small muted log-start">Before the log started: ${fmtNum(startedAt)}${g.unit ? ' ' + esc(g.unit) : ''}</p>` : ''}
+    </section>`;
+}
+
+const KINDS = [['daily', 'Daily'], ['weekly', 'Weekly'], ['total', 'Amount']];
 
 function viewGoalForm(id) {
   const g = id ? goalById(id) : null;
   if (id && !g) return viewNotFound('#/goals', 'Goals');
-  const d = g || { name: '', valueId: '', why: '', current: 0, target: 10, unit: '', next: '', habit: { name: '', perWeek: 3 } };
-  const habit = d.habit || { name: '', perWeek: 3 };
+  const d = g || { name: '', kind: 'daily', perMonth: 20, target: 1, unit: '' };
+  const back = g ? `#/goals/${esc(g.id)}` : '#/goals';
+  const show = (k) => (d.kind === k ? '' : ' hidden');
   return `
-    ${backLink('#/goals', 'Goals')}
+    ${backLink(back, g ? g.name : 'Goals')}
     <header><h1 class="title">${g ? 'Edit Goal' : 'Add Goal'}</h1></header>
     <form class="stack" data-form="goal" data-id="${g ? esc(g.id) : ''}">
-      <label class="field"><span>Goal</span><input type="text" name="name" value="${esc(d.name)}" maxlength="200" required placeholder="Run a 10K"></label>
-      <label class="field"><span>Which value does it serve?</span><select name="valueId"><option value="">None</option>${state.values.map((v) => `<option value="${esc(v.id)}"${v.id === d.valueId ? ' selected' : ''}>${esc(v.name)}</option>`).join('')}</select></label>
-      <label class="field"><span>Why it matters</span><input type="text" name="why" value="${esc(d.why)}" placeholder="Because I can do hard things"></label>
-      <fieldset class="stack-s"><legend class="legend">Progress</legend>
-        <div class="two">
-          <label class="field"><span class="small muted">Now</span><input type="number" name="current" value="${esc(fmtNum(d.current))}" min="0" step="any" inputmode="decimal"></label>
-          <label class="field"><span class="small muted">Target</span><input type="number" name="target" value="${esc(fmtNum(d.target))}" min="1" step="any" inputmode="decimal" required></label>
+      <label class="field"><span>Goal</span><input type="text" name="name" value="${esc(d.name)}" maxlength="200" required placeholder="Workout"></label>
+      <fieldset><legend class="legend">How often</legend><div class="seg">${radios('kind', KINDS, d.kind, 'data-kind')}</div></fieldset>
+      <label class="field" data-for="daily"${show('daily')}><span>Days a month</span><input type="number" name="perDays" value="${d.kind === 'daily' ? d.perMonth : 20}" min="1" max="31" inputmode="numeric"><span class="hint">Your target for each month, e.g. 20 workouts.</span></label>
+      <label class="field" data-for="weekly"${show('weekly')}><span>Weeks a month</span><select name="perWeeks">${[1, 2, 3, 4, 5].map((n) => `<option value="${n}"${n === (d.kind === 'weekly' ? d.perMonth : 4) ? ' selected' : ''}>${n}</option>`).join('')}</select><span class="hint">Your target for each month, e.g. call family 4 weeks.</span></label>
+      <div class="field" data-for="total"${show('total')}><span id="target-label">Target</span>
+        <div class="target-row" role="group" aria-labelledby="target-label">
+          <input type="number" name="target" value="${g && d.kind === 'total' ? esc(fmtNum(d.target)) : ''}" min="1" step="any" inputmode="decimal" placeholder="12" aria-label="Target amount">
+          <input type="text" name="unit" value="${esc(d.unit)}" maxlength="40" placeholder="books" aria-label="Unit">
         </div>
-        <label class="field"><span class="small muted">Unit (optional)</span><input type="text" name="unit" value="${esc(d.unit)}" maxlength="40" placeholder="km, books, steps"></label>
-      </fieldset>
-      <label class="field"><span>Next step</span><input type="text" name="next" value="${esc(d.next)}" placeholder="Run 8K"></label>
-      <fieldset class="section stack-s"><legend class="legend float-legend">Habit (optional)</legend>
-        <label class="field clear"><span class="small muted">A small action that moves this goal forward</span><input type="text" name="habitName" value="${esc(habit.name)}" placeholder="Morning run"></label>
-        <label class="field"><span class="small muted">Times a week</span><select name="perWeek">${[1, 2, 3, 4, 5, 6, 7].map((n) => `<option value="${n}"${n === Number(habit.perWeek) ? ' selected' : ''}>${n}</option>`).join('')}</select></label>
-      </fieldset>
-      <div class="actions"><a class="btn btn-quiet" href="#/goals">Cancel</a><button class="btn btn-primary" type="submit">Save goal</button></div>
+      </div>
+      <div class="actions"><a class="btn btn-quiet" href="${back}">Cancel</a><button class="btn btn-primary" type="submit">Save goal</button></div>
       ${g ? `<button type="button" class="btn btn-danger btn-block" data-action="deleteGoal" data-id="${esc(g.id)}">Delete goal</button>` : ''}
     </form>`;
 }
 
+const sameMonth = (a, b) => a.slice(0, 7) === b.slice(0, 7);
+function eventDays(e) {
+  if (!e.endDate) return weekdayShort(e.date);
+  const end = sameMonth(e.date, e.endDate) ? weekdayShort(e.endDate) : `${weekdayShort(e.endDate)} ${shortDate(e.endDate)}`;
+  return `${weekdayShort(e.date)} to ${end}`;
+}
 function eventMeta(e) {
-  return [e.time ? `${weekdayShort(e.date)} ${time12(e.time)}` : weekdayShort(e.date), e.place, e.cost].filter(Boolean).map(esc).join(', ');
+  return [e.time ? `${eventDays(e)}, ${time12(e.time)}` : eventDays(e), e.place, e.cost].filter(Boolean).map(esc).join(', ');
 }
 function eventRow(e, past) {
-  const status = e.status === 'registered' ? '<span class="strong">Registered</span>' : e.status === 'attended' ? 'Attended' : 'Considering';
+  const t = dkey();
+  const range = e.endDate && sameMonth(e.date, e.endDate);
+  let status = e.status === 'registered' ? '<span class="strong">Registered</span>' : e.status === 'attended' ? 'Attended' : 'Considering';
+  if (!past && e.endDate && e.date <= t) status = `<span class="strong">Day ${dayIndex(t) - dayIndex(e.date) + 1} of ${dayIndex(e.endDate) - dayIndex(e.date) + 1}</span>, ${status}`;
   const goal = !past && goalById(e.goalId);
   const extra = past
     ? (e.takeaway ? `<p class="body takeaway">“${esc(e.takeaway)}”</p>` : '<p class="small reflect">Add a reflection</p>')
-    : [goal ? `<p class="small muted">Toward ${esc(goal.name)}</p>` : '', e.braveStep ? `<p class="small muted">Brave step: ${esc(e.braveStep)}</p>` : ''].join('');
+    : [goal ? `<p class="small muted">Toward ${esc(goal.name)}</p>` : ''].join('');
   return `<a class="event-row" href="#/events/${esc(e.id)}">
-    <div><span class="d num">${dayNumber(e.date)}</span><span class="label">${esc(monthShort(e.date))}</span></div>
+    <div><span class="d num${range ? ' range' : ''}">${dayNumber(e.date)}${range ? `–${dayNumber(e.endDate)}` : ''}</span><span class="label">${esc(monthShort(e.date))}</span></div>
     <div class="grow"><p class="strong ev-title">${esc(e.title)}</p><p class="small muted">${eventMeta(e)}</p><p class="small muted">${status}</p>${extra}</div>
   </a>`;
 }
@@ -942,21 +1163,24 @@ function viewEvents(f) {
 function viewEventForm(id) {
   const ev = id ? eventById(id) : null;
   if (id && !ev) return viewNotFound('#/events', 'Events');
-  const d = ev || { title: '', date: dkey(), time: '', place: '', cost: '', status: 'considering', goalId: '', braveStep: '', takeaway: '', people: '', action: '', actionDone: false };
+  const d = ev || { title: '', date: dkey(), time: '', place: '', cost: '', status: 'considering', goalId: '', takeaway: '', people: '', action: '', actionDone: false };
   return `
     ${backLink('#/events', 'Events')}
     <header><h1 class="title">${ev ? 'Edit Event' : 'Add Event'}</h1></header>
     <form class="stack" data-form="event" data-id="${ev ? esc(ev.id) : ''}">
       <label class="field"><span>Name</span><input type="text" name="title" value="${esc(d.title)}" maxlength="200" required placeholder="Public Speaking Workshop"></label>
-      <div class="two">
-        <label class="field"><span>Date</span><input type="date" name="date" value="${esc(d.date)}" required></label>
-        <label class="field"><span>Time</span><input type="time" name="time" value="${esc(d.time)}"></label>
+      <div class="stack-s">
+        <div class="two">
+          <label class="field"><span>Starts</span><input type="date" name="date" value="${esc(d.date)}" required data-start></label>
+          <label class="field"><span>Ends (optional)</span><input type="date" name="endDate" value="${esc(d.endDate || '')}" min="${esc(d.date)}"></label>
+        </div>
+        <span class="hint">Leave the end empty for a one-day event.</span>
       </div>
+      <label class="field"><span>Start time</span><input type="time" name="time" value="${esc(d.time)}"></label>
       <label class="field"><span>Place</span><input type="text" name="place" value="${esc(d.place)}" placeholder="Venue or link"></label>
       <label class="field"><span>Cost</span><input type="text" name="cost" value="${esc(d.cost)}" placeholder="Free"></label>
       <fieldset><legend class="legend">Status</legend><div class="seg">${radios('status', STATUSES, d.status, 'data-status')}</div></fieldset>
       <label class="field"><span>Toward a goal</span><select name="goalId"><option value="">None</option>${state.goals.map((g) => `<option value="${esc(g.id)}"${g.id === d.goalId ? ' selected' : ''}>${esc(g.name)}</option>`).join('')}</select></label>
-      <label class="field"><span>Brave step</span><input type="text" name="braveStep" value="${esc(d.braveStep)}" placeholder="Say hi to one new person"></label>
       <fieldset class="section stack" data-after${d.status === 'attended' ? '' : ' hidden'}><legend class="label float-legend">After the event</legend>
         <label class="field clear"><span>Key takeaway</span><textarea name="takeaway" rows="3">${esc(d.takeaway)}</textarea></label>
         <label class="field"><span>People I met</span><input type="text" name="people" value="${esc(d.people)}"></label>
@@ -1096,8 +1320,10 @@ function render() {
           break;
         }
         case 'goals':
-          if (parts[1]) html = viewGoalForm(parts[1] === 'new' ? null : parts[1]);
-          else { html = viewGoals(); tab = 'goals'; }
+          if (parts[1] === 'new') html = viewGoalForm(null);
+          else if (parts[1] && parts[2] === 'edit') html = viewGoalForm(parts[1]);
+          else if (parts[1]) html = viewGoal(parts[1], q.get('m'));
+          else { html = viewGoals(q.get('m')); tab = 'goals'; }
           break;
         case 'events':
           if (parts[1]) html = viewEventForm(parts[1] === 'new' ? null : parts[1]);
@@ -1135,14 +1361,6 @@ function render() {
 /* ---------- Actions ---------- */
 
 const actions = {
-  habit(el) {
-    const { id, d } = el.dataset;
-    if (!goalById(id) || !isDay(d)) return;
-    const log = state.habitLog[id] || (state.habitLog[id] = dict());
-    if (log[d]) delete log[d]; else log[d] = true;
-    save();
-    render();
-  },
   undoPractice(el) {
     const t = dkey();
     if (state.practiceDone[t]) delete state.practiceDone[t][el.dataset.id];
@@ -1164,16 +1382,28 @@ const actions = {
     render();
     toast(`Recommitted for ${fmt(dkey(), { month: 'long' })}`);
   },
-  goalStep(el) {
+  openLog(el) {
+    const form = el.closest('.goal').querySelector('.log-inline');
+    document.querySelectorAll('.log-inline').forEach((x) => { if (x !== form) x.hidden = true; });
+    form.hidden = !form.hidden;
+    if (!form.hidden) form.elements.note.focus();
+  },
+  closeLog(el) {
+    el.closest('form').hidden = true;
+  },
+  tick(el) {
     const g = goalById(el.dataset.id);
-    if (!g) return;
-    g.current = Math.max(0, Math.round((Number(g.current) + Number(el.dataset.delta)) * 100) / 100);
+    const k = el.dataset.k;
+    if (!g || g.kind === 'total') return;
+    const valid = g.kind === 'daily' ? isDay(k) && k <= dkey() : /^\d{4}-\d{2}-W[1-5]$/.test(k) && k.slice(0, 7) <= monthOf(dkey());
+    if (!valid) return;
+    if (g.done[k]) delete g.done[k]; else g.done[k] = true;
     save();
     render();
   },
   deleteGoal(el) {
     const g = goalById(el.dataset.id);
-    if (!g || !confirm(`Delete "${g.name}" and its habit history?`)) return;
+    if (!g || !confirm(`Delete "${g.name}"?`)) return;
     state.goals = state.goals.filter((x) => x.id !== g.id);
     delete state.habitLog[g.id];
     state.events.forEach((e) => { if (e.goalId === g.id) e.goalId = ''; });
@@ -1307,18 +1537,37 @@ const forms = {
     const name = requireText(f, 'name');
     if (!name) return;
     g.name = name.slice(0, 200);
-    g.valueId = valueById(fd.get('valueId')) ? fd.get('valueId') : '';
-    g.why = (fd.get('why') || '').trim();
-    g.current = Math.max(0, num(fd.get('current')));
-    g.target = Math.max(1, num(fd.get('target'), 1));
-    g.unit = (fd.get('unit') || '').trim().slice(0, 40);
-    g.next = (fd.get('next') || '').trim();
-    const hn = (fd.get('habitName') || '').trim();
-    g.habit = hn ? { name: hn, perWeek: Math.min(7, Math.max(1, num(fd.get('perWeek'), 3))) } : null;
+    g.kind = oneOf(fd.get('kind'), KINDS.map((x) => x[0]), 'daily');
+    if (g.kind === 'daily') g.perMonth = Math.min(31, Math.max(1, Math.round(num(fd.get('perDays'), 20))));
+    if (g.kind === 'weekly') g.perMonth = Math.min(5, Math.max(1, Math.round(num(fd.get('perWeeks'), 4))));
+    if (g.kind === 'total') {
+      g.target = Math.max(1, num(fd.get('target'), 1));
+      g.unit = (fd.get('unit') || '').trim().slice(0, 40);
+    }
+    g.current = g.current || 0;
+    g.target = g.target || 1;
+    g.unit = g.unit || '';
+    if (!g.done) g.done = dict();
+    if (!g.log) g.log = [];
     if (!id) state.goals.push(g);
     save();
-    go('#/goals', { replace: true });
+    go(id ? `#/goals/${g.id}` : '#/goals', { replace: true });
     toast(id ? 'Goal saved' : 'Goal added');
+  },
+  logProgress(f, fd) {
+    const g = goalById(f.dataset.id);
+    if (!g) return;
+    const amount = num(fd.get('amount'));
+    if (!amount) {
+      f.elements.amount.setCustomValidity('Enter an amount other than 0.');
+      f.elements.amount.reportValidity();
+      f.elements.amount.setCustomValidity('');
+      return;
+    }
+    logProgress(g, amount, (fd.get('note') || '').trim().slice(0, 300));
+    save();
+    render();
+    toast('Progress logged');
   },
   event(f, fd) {
     const id = f.dataset.id;
@@ -1326,15 +1575,23 @@ const forms = {
     if (!e) { toast('This event no longer exists.'); go('#/events', { replace: true }); return; }
     const title = requireText(f, 'title');
     if (!title) return;
+    const date = isDay(fd.get('date')) ? fd.get('date') : dkey();
+    const end = fd.get('endDate');
+    if (isDay(end) && end < date) {
+      f.elements.endDate.setCustomValidity('The end date is before the start date.');
+      f.elements.endDate.reportValidity();
+      f.elements.endDate.setCustomValidity('');
+      return;
+    }
     Object.assign(e, {
       title: title.slice(0, 200),
-      date: isDay(fd.get('date')) ? fd.get('date') : dkey(),
+      date,
+      endDate: isDay(end) && end > date ? end : '',
       time: isTime(fd.get('time')) ? fd.get('time') : '',
       place: (fd.get('place') || '').trim(),
       cost: (fd.get('cost') || '').trim(),
       status: oneOf(fd.get('status'), STATUSES.map((x) => x[0]), 'considering'),
       goalId: goalById(fd.get('goalId')) ? fd.get('goalId') : '',
-      braveStep: (fd.get('braveStep') || '').trim(),
       takeaway: (fd.get('takeaway') || '').trim(),
       people: (fd.get('people') || '').trim(),
       action: (fd.get('action') || '').trim(),
@@ -1482,6 +1739,10 @@ document.addEventListener('change', async (e) => {
     const vals = Array.from(document.querySelectorAll(`input[name="${CSS.escape(el.name)}"]:checked`)).map((x) => x.value);
     setJ(el.dataset.d, el.dataset.part, el.dataset.j, vals);
     save();
+  } else if (el.hasAttribute('data-kind')) {
+    el.form.querySelectorAll('[data-for]').forEach((x) => { x.hidden = x.dataset.for !== el.value; });
+  } else if (el.hasAttribute('data-start')) {
+    el.form.elements.endDate.min = el.value;
   } else if (el.hasAttribute('data-status')) {
     // "After the event" only applies once the event is marked attended. Hidden fields still save.
     const after = el.form.querySelector('[data-after]');
